@@ -204,19 +204,36 @@ if __name__ == "__main__":
 
             prompt_compute_btn = gr.Button(value="Step 1 - Create dataset")
         
+            # new code
+            import zipfile
+
             def preprocess_dataset(audio_path, language, out_path, progress=gr.Progress(track_tqdm=True)):
+                print('pre-processing started')
                 clear_gpu_cache()
                 out_path = os.path.join(out_path, "dataset")
                 os.makedirs(out_path, exist_ok=True)
+                
                 if audio_path is None:
                     return "You should provide one or multiple audio files! If you provided it, probably the upload of the files is not finished yet!", "", ""
-                else:
-                    try:
-                        train_meta, eval_meta, audio_total_size = format_audio_list(audio_path, target_language=language, out_path=out_path, gradio_progress=progress)
-                    except:
-                        traceback.print_exc()
-                        error = traceback.format_exc()
-                        return f"The data processing was interrupted due an error !! Please check the console to verify the full error message! \n Error summary: {error}", "", ""
+
+                audio_files = []
+                for file in audio_path:
+                    if file.endswith('.zip'):
+                        print('found zip file', file)
+                        with zipfile.ZipFile(file, 'r') as zip_ref:
+                            zip_ref.extractall(out_path)
+                            # Collect extracted audio files from any subdirectory
+                            audio_files.extend([os.path.join(out_path, f) for f in zip_ref.namelist() if f.endswith(('.mp3', '.wav', '.flac')) and not os.path.basename(f).startswith('._')])
+                            print('audio files', audio_files)
+                    else:
+                        audio_files.append(file)
+
+                try:
+                    train_meta, eval_meta, audio_total_size = format_audio_list(audio_files, target_language=language, out_path=out_path, gradio_progress=progress)
+                except:
+                    traceback.print_exc()
+                    error = traceback.format_exc()
+                    return f"The data processing was interrupted due an error !! Please check the console to verify the full error message! \n Error summary: {error}", "", ""
 
                 clear_gpu_cache()
 
@@ -228,6 +245,7 @@ if __name__ == "__main__":
 
                 print("Dataset Processed!")
                 return "Dataset Processed!", train_meta, eval_meta
+
 
         with gr.Tab("2 - Fine-tuning XTTS Encoder"):
             train_csv = gr.Textbox(
