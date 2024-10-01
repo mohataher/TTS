@@ -11,6 +11,7 @@ import torch
 import torchaudio
 # torch.set_num_threads(1)
 
+
 from TTS.tts.layers.xtts.tokenizer import multilingual_cleaners
 
 torch.set_num_threads(16)
@@ -18,7 +19,50 @@ torch.set_num_threads(16)
 
 import os
 
+
 audio_types = (".wav", ".mp3", ".flac")
+
+
+from seamless_communication.inference import Translator
+AUDIO_SAMPLE_RATE = 16000.0
+MAX_INPUT_AUDIO_LENGTH = 60  # in seconds
+DEFAULT_TARGET_LANGUAGE = "Egyptian Arabic"
+
+if torch.cuda.is_available():
+    device = torch.device("cuda:0")
+    dtype = torch.float16
+else:
+    device = torch.device("cpu")
+    dtype = torch.float32
+  
+dtype = torch.float16
+
+
+
+
+def preprocess_audio(input_audio: str) -> None:
+    arr, org_sr = torchaudio.load(input_audio)
+    new_arr = torchaudio.functional.resample(arr, orig_freq=org_sr, new_freq=AUDIO_SAMPLE_RATE)
+    max_length = int(MAX_INPUT_AUDIO_LENGTH * AUDIO_SAMPLE_RATE)
+    if new_arr.shape[1] > max_length:
+        new_arr = new_arr[:, :max_length]
+        print(f"Input audio is too long. Only the first {MAX_INPUT_AUDIO_LENGTH} seconds is used.")
+    torchaudio.save(input_audio, new_arr, sample_rate=int(AUDIO_SAMPLE_RATE))
+
+
+
+def run_asr(translator, input_audio: str, target_language: str) -> str:
+    preprocess_audio(input_audio)
+    target_language_code = target_language # LANGUAGE_NAME_TO_CODE[target_language]
+    out_texts, _ = translator.predict(
+        input=input_audio,
+        task_str="ASR",
+        src_lang=target_language_code,
+        tgt_lang=target_language_code,
+    )
+    return str(out_texts[0])
+
+
 
 
 def list_audios(basePath, contains=None):
@@ -50,10 +94,17 @@ def format_audio_list(audio_files, target_language="en", out_path=None, buffer=0
     os.makedirs(out_path, exist_ok=True)
 
     # Loading Whisper
-    device = "cuda" if torch.cuda.is_available() else "cpu" 
+    #device = "cuda" if torch.cuda.is_available() else "cpu" 
 
-    print("Loading Whisper Model!")
-    asr_model = WhisperModel("large-v2", device=device, compute_type="float16")
+    print("Loading running ASR seamless")
+    translator = Translator(
+      model_name_or_card="seamlessM4T_v2_large",
+      vocoder_name_or_card="vocoder_v2",
+      device=device,
+      dtype=dtype,
+      apply_mintox=True,
+    )
+    #asr_model = WhisperModel("asr-whisper-large-v2-commonvoice-ar", device=device, compute_type="float16")
 
     metadata = {"audio_file": [], "text": [], "speaker_name": []}
 
@@ -62,6 +113,7 @@ def format_audio_list(audio_files, target_language="en", out_path=None, buffer=0
     else:
         tqdm_object = tqdm(audio_files)
 
+    i=0
     for audio_path in tqdm_object:
         wav, sr = torchaudio.load(audio_path)
         # stereo to mono if needed
@@ -71,72 +123,36 @@ def format_audio_list(audio_files, target_language="en", out_path=None, buffer=0
         wav = wav.squeeze()
         audio_total_size += (wav.size(-1) / sr)
 
-        segments, _ = asr_model.transcribe(audio_path, word_timestamps=True, language=target_language)
-        segments = list(segments)
-        i = 0
-        sentence = ""
-        sentence_start = None
+        #segments, _ = asr_model.transcribe(audio_path, word_timestamps=True, language=target_language)
+        segments = run_asr(translator, audio_path, target_language='arz')
+        print(segments)
+        
+
+        sentence = segments
+        # Expand number and abbreviations plus normalization
+        sentence = multilingual_cleaners(sentence, target_language)
+        audio_file_name, _ = os.path.splitext(os.path.basename(audio_path))
+        i += 1
+        audio_file = f"wavs/{audio_file_name}_{str(i).zfill(8)}.wav"
+        
+        absoulte_path = os.path.join(out_path, audio_file)
+        os.makedirs(os.path.dirname(absoulte_path), exist_ok=True)
         first_word = True
-        # added all segments words in a unique list
-        words_list = []
-        for _, segment in enumerate(segments):
-            words = list(segment.words)
-            words_list.extend(words)
 
-        # process each word
-        for word_idx, word in enumerate(words_list):
-            if first_word:
-                sentence_start = word.start
-                # If it is the first sentence, add buffer or get the begining of the file
-                if word_idx == 0:
-                    sentence_start = max(sentence_start - buffer, 0)  # Add buffer to the sentence start
-                else:
-                    # get previous sentence end
-                    previous_word_end = words_list[word_idx - 1].end
-                    # add buffer or get the silence midle between the previous sentence and the current one
-                    sentence_start = max(sentence_start - buffer, (previous_word_end + sentence_start)/2)
+        audio = wav.unsqueeze(0)
+        # if the audio is too short ignore it (i.e < 0.33 seconds)
+        #if audio.size(-1) >= sr/3:
+        torchaudio.save(absoulte_path,
+            audio,
+            sr
+        )
+        #else:
+        #    print('skipped audio')
+        #    continue
 
-                sentence = word.word
-                first_word = False
-            else:
-                sentence += word.word
-
-            if word.word[-1] in ["!", ".", "?"]:
-                sentence = sentence[1:]
-                # Expand number and abbreviations plus normalization
-                sentence = multilingual_cleaners(sentence, target_language)
-                audio_file_name, _ = os.path.splitext(os.path.basename(audio_path))
-
-                audio_file = f"wavs/{audio_file_name}_{str(i).zfill(8)}.wav"
-
-                # Check for the next word's existence
-                if word_idx + 1 < len(words_list):
-                    next_word_start = words_list[word_idx + 1].start
-                else:
-                    # If don't have more words it means that it is the last sentence then use the audio len as next word start
-                    next_word_start = (wav.shape[0] - 1) / sr
-
-                # Average the current word end and next word start
-                word_end = min((word.end + next_word_start) / 2, word.end + buffer)
-                
-                absoulte_path = os.path.join(out_path, audio_file)
-                os.makedirs(os.path.dirname(absoulte_path), exist_ok=True)
-                i += 1
-                first_word = True
-
-                audio = wav[int(sr*sentence_start):int(sr*word_end)].unsqueeze(0)
-                # if the audio is too short ignore it (i.e < 0.33 seconds)
-                if audio.size(-1) >= sr/3:
-                    torchaudio.save(absoulte_path,
-                        audio,
-                        sr
-                    )
-                else:
-                    continue
-
-                metadata["audio_file"].append(audio_file)
-                metadata["text"].append(sentence)
-                metadata["speaker_name"].append(speaker_name)
+        metadata["audio_file"].append(audio_file)
+        metadata["text"].append(sentence)
+        metadata["speaker_name"].append(speaker_name)
 
     df = pandas.DataFrame(metadata)
     df = df.sample(frac=1)
@@ -154,7 +170,7 @@ def format_audio_list(audio_files, target_language="en", out_path=None, buffer=0
     df_eval.to_csv(eval_metadata_path, sep="|", index=False)
 
     # deallocate VRAM and RAM
-    del asr_model, df_train, df_eval, df, metadata
+    del translator, df_train, df_eval, df, metadata
     gc.collect()
 
     return train_metadata_path, eval_metadata_path, audio_total_size
